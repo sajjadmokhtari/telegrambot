@@ -49,6 +49,17 @@ type PendingReceipt struct {
 // نگهداری فیش‌های در انتظار بررسی
 var pendingReceipts = make(map[string]PendingReceipt)
 
+// وضعیت مرحله‌ای شارژ دستی
+var adminManualChargeState = struct {
+    Step int
+    TargetUserID int64
+}{Step: 0, TargetUserID: 0}
+
+// وضعیت اطلاع‌رسانی همگانی
+var adminBroadcastState = struct {
+    Waiting bool
+}{Waiting: false}
+
 // راه‌اندازی دیتابیس و ساخت جدول شارژها و سرویس‌ها
 func initDB() {
     var err error
@@ -88,6 +99,23 @@ func sendDBBackupToAdmin(bot *tgbotapi.BotAPI, adminID int64) {
     bot.Send(doc)
 }
 
+// واکشی همه آیدی کاربران از جدول charges
+func getAllUserIDsFromDB() ([]int64, error) {
+    rows, err := db.Query("SELECT DISTINCT user_id FROM charges")
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    var ids []int64
+    for rows.Next() {
+        var id int64
+        if err := rows.Scan(&id); err == nil {
+            ids = append(ids, id)
+        }
+    }
+    return ids, nil
+}
+
 // تابع اصلی
 func main() {
     initDB()
@@ -111,7 +139,7 @@ func NewTelegramBot() *TelegramBot {
         log.Panic(err)
     }
 
-    return &TelegramBot{
+    tg := &TelegramBot{
         bot:        bot,
         balances:   make(map[int64]int),
         users:      make(map[int64]string),
@@ -119,6 +147,8 @@ func NewTelegramBot() *TelegramBot {
         processedReceipts: make(map[string]bool),
         adminID:    adminID,
     }
+    tg.loadAllBalancesFromDB() // بارگذاری موجودی کاربران از دیتابیس
+    return tg
 }
 
 // شروع ربات و گوش دادن به پیام‌ها
@@ -146,12 +176,6 @@ func (t *TelegramBot) handleUpdate(update tgbotapi.Update) {
     }
 }
 
-// state افزودن سرویس توسط ادمین
-var adminAddServiceState = struct {
-    Step   int
-    Data   map[string]string
-}{Step: 0, Data: make(map[string]string)}
-
 // مدیریت پیام‌های متنی
 func (t *TelegramBot) handleMessage(message *tgbotapi.Message) {
     chatID := message.Chat.ID
@@ -160,43 +184,80 @@ func (t *TelegramBot) handleMessage(message *tgbotapi.Message) {
     // ثبت اطلاعات کاربر
     t.registerUser(userID, message.From.FirstName+" "+message.From.LastName)
 
-    // فرآیند مرحله‌ای افزودن سرویس توسط ادمین (توضیحات و قیمت)
-    if userID == t.adminID && adminAddServiceState.Step > 0 {
-        switch adminAddServiceState.Step {
+    // فرآیند مرحله‌ای شارژ دستی توسط ادمین
+    if userID == t.adminID && adminManualChargeState.Step > 0 {
+        switch adminManualChargeState.Step {
         case 1:
-            adminAddServiceState.Data["desc"] = message.Text
-            t.bot.Send(tgbotapi.NewMessage(chatID, "💰 قیمت (تومان)؟"))
-            adminAddServiceState.Step = 2
-            return
-        case 2:
-            adminAddServiceState.Data["price"] = message.Text
-            // ذخیره در دیتابیس
-            desc := adminAddServiceState.Data["desc"]
-            priceStr := adminAddServiceState.Data["price"]
-            price, err := strconv.Atoi(priceStr)
-            if err != nil || price <= 0 {
-                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ قیمت باید عدد مثبت باشد. فرآیند لغو شد."))
-                adminAddServiceState.Step = 0
-                adminAddServiceState.Data = make(map[string]string)
+            // دریافت آیدی عددی
+            id, err := strconv.ParseInt(message.Text, 10, 64)
+            if err != nil || id <= 0 {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ آیدی عددی معتبر وارد کنید."))
                 return
             }
-            _, err = db.Exec("INSERT INTO services (name, description, price) VALUES (?, ?, ?)", desc, desc, price)
-            if err != nil {
-                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در افزودن سرویس یا این سرویس قبلاً وجود دارد."))
-            } else {
-                t.bot.Send(tgbotapi.NewMessage(chatID, "✅ سرویس با موفقیت افزوده شد."))
+            adminManualChargeState.TargetUserID = id
+            t.bot.Send(tgbotapi.NewMessage(chatID, "💰 مبلغ شارژ را وارد کنید (تومان):"))
+            adminManualChargeState.Step = 2
+            return
+        case 2:
+            // دریافت مبلغ
+            amount, err := strconv.Atoi(message.Text)
+            if err != nil || amount <= 0 {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ مبلغ معتبر وارد کنید (مثلاً 50000)."))
+                return
             }
-            adminAddServiceState.Step = 0
-            adminAddServiceState.Data = make(map[string]string)
+            // شارژ کاربر
+            _, err = db.Exec("INSERT INTO charges (user_id, amount) VALUES (?, ?)", adminManualChargeState.TargetUserID, amount)
+            if err != nil {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در ثبت شارژ: "+err.Error()))
+            } else {
+                // افزایش موجودی در map حافظه
+                t.balances[adminManualChargeState.TargetUserID] += amount
+                t.bot.Send(tgbotapi.NewMessage(chatID, "✅ مبلغ با موفقیت به کاربر اضافه شد."))
+                // اطلاع به کاربر
+                t.bot.Send(tgbotapi.NewMessage(adminManualChargeState.TargetUserID, fmt.Sprintf("👑 ادمین مبلغ %d تومان به حساب شما اضافه کرد!", amount)))
+            }
+            adminManualChargeState.Step = 0
+            adminManualChargeState.TargetUserID = 0
             return
         }
     }
 
-    // منطق شروع فرآیند افزودن سرویس توسط ادمین
-    if userID == t.adminID && message.Text == "شروع افزودن سرویس" {
-        t.bot.Send(tgbotapi.NewMessage(chatID, "📝 توضیحات سرویس را وارد کنید (مثال: اینترنت ۲ کاربره، ۵۰ گیگ، ۳ ماهه):"))
-        adminAddServiceState.Step = 1
-        adminAddServiceState.Data = make(map[string]string)
+    // اطلاع‌رسانی همگانی: اگر ادمین در حالت انتظار پیام است
+    if userID == t.adminID && adminBroadcastState.Waiting {
+        text := message.Text
+        // ارسال پیام به همه کاربران دیتابیس
+        ids, err := getAllUserIDsFromDB()
+        if err != nil || len(ids) == 0 {
+            t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در واکشی کاربران یا هیچ کاربری یافت نشد."))
+        } else {
+            for _, uid := range ids {
+                t.bot.Send(tgbotapi.NewMessage(uid, text))
+            }
+            // پیام تایید و دکمه بازگشت
+            msg := tgbotapi.NewMessage(chatID, "✅ پیام با موفقیت برای همه کاربران ارسال شد.")
+            msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+                tgbotapi.NewInlineKeyboardRow(
+                    tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به پنل ادمین", "back_to_admin_panel"),
+                ),
+            )
+            t.bot.Send(msg)
+        }
+        adminBroadcastState.Waiting = false
+        return
+    }
+
+    // شروع فرآیند شارژ دستی
+    if userID == t.adminID && (message.Text == "شارژ دستی کاربر" || message.Text == "/manual_charge") {
+        adminManualChargeState.Step = 1
+        adminManualChargeState.TargetUserID = 0
+        t.bot.Send(tgbotapi.NewMessage(chatID, "🔢 آیدی عددی کاربر را وارد کنید:"))
+        return
+    }
+
+    // شروع اطلاع‌رسانی همگانی
+    if userID == t.adminID && message.Text == "اطلاع رسانی همگانی" {
+        adminBroadcastState.Waiting = true
+        t.bot.Send(tgbotapi.NewMessage(chatID, "✏️ لطفاً پیام مورد نظر برای ارسال به همه کاربران را وارد کنید:"))
         return
     }
 
@@ -261,6 +322,9 @@ func (t *TelegramBot) showAdminMenu(chatID int64) {
         tgbotapi.NewInlineKeyboardRow(
             tgbotapi.NewInlineKeyboardButtonData("➕ افزودن سرویس", "start_add_service"),
             tgbotapi.NewInlineKeyboardButtonData("🗑 حذف سرویس", "delete_service"),
+        ),
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("📢 اطلاع رسانی همگانی", "broadcast"),
         ),
     )
     msg := tgbotapi.NewMessage(chatID, "👑 به پنل ادمین خوش اومدی")
@@ -402,7 +466,9 @@ func (t *TelegramBot) handleCallbackQuery(callback *tgbotapi.CallbackQuery) {
     case "tutorials":
         t.showTutorials(chatID)
     case "manual_charge":
-        t.showManualChargeFormat(chatID)
+        adminManualChargeState.Step = 1
+        adminManualChargeState.TargetUserID = 0
+        t.bot.Send(tgbotapi.NewMessage(chatID, "🔢 آیدی عددی کاربر را وارد کنید:"))
     case "user_info":
         t.showAllUsersInfo(chatID)
     case "back_to_menu":
@@ -411,6 +477,11 @@ func (t *TelegramBot) handleCallbackQuery(callback *tgbotapi.CallbackQuery) {
         t.bot.Send(tgbotapi.NewMessage(chatID, "لطفاً پیام 'شروع افزودن سرویس' را ارسال کنید."))
     case "delete_service":
         t.showServicesForAdminDelete(chatID)
+    case "broadcast":
+        adminBroadcastState.Waiting = true
+        t.bot.Send(tgbotapi.NewMessage(chatID, "✏️ لطفاً پیام مورد نظر برای ارسال به همه کاربران را وارد کنید:"))
+    case "back_to_admin_panel":
+        t.showAdminMenu(chatID)
     default:
         if strings.HasPrefix(data, "delete_service_") {
             serviceID := strings.TrimPrefix(data, "delete_service_")
@@ -494,17 +565,6 @@ func (t *TelegramBot) showTutorials(chatID int64) {
     t.bot.Send(msg)
 }
 
-// نمایش فرمت شارژ دستی
-func (t *TelegramBot) showManualChargeFormat(chatID int64) {
-    msg := tgbotapi.NewMessage(chatID, "✏️ فرمت شارژ دستی:\n\n`شارژ <UserID> <مبلغ>`")
-    msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-        tgbotapi.NewInlineKeyboardRow(
-            tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به منو", "back_to_menu"),
-        ),
-    )
-    t.bot.Send(msg)
-}
-
 // نمایش اطلاعات تمام کاربران
 func (t *TelegramBot) showAllUsersInfo(chatID int64) {
     var info string
@@ -543,9 +603,8 @@ func (t *TelegramBot) showServicesForUser(chatID int64, userID int64) {
     // ساخت دکمه‌ها
     var btns [][]tgbotapi.InlineKeyboardButton
     for _, s := range services {
-        text := s.Desc + " | " + fmt.Sprintf("%d تومان", s.Price)
         btns = append(btns, tgbotapi.NewInlineKeyboardRow(
-            tgbotapi.NewInlineKeyboardButtonData(text, fmt.Sprintf("service_%d", s.ID)),
+            tgbotapi.NewInlineKeyboardButtonData(s.Desc, fmt.Sprintf("service_%d", s.ID)),
         ))
     }
     msg := tgbotapi.NewMessage(chatID, "لطفاً یکی از سرویس‌های زیر را انتخاب کن:")
@@ -688,6 +747,23 @@ func (t *TelegramBot) handleAdminDeleteService(chatID int64, serviceID string) {
     } else {
         t.bot.Send(tgbotapi.NewMessage(chatID, "✅ سرویس با موفقیت حذف شد."))
     }
+}
+
+// محاسبه و بارگذاری موجودی همه کاربران از دیتابیس
+func (t *TelegramBot) loadAllBalancesFromDB() error {
+    rows, err := db.Query("SELECT user_id, SUM(amount) FROM charges GROUP BY user_id")
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    for rows.Next() {
+        var uid int64
+        var sum int
+        if err := rows.Scan(&uid, &sum); err == nil {
+            t.balances[uid] = sum
+        }
+    }
+    return nil
 }
 
 
