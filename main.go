@@ -21,6 +21,7 @@ type TelegramBot struct {
     balances      map[int64]int
     users         map[int64]string
     userStates    map[int64]*UserState
+    processedReceipts map[string]bool // نگهداری فیش‌های پردازش شده
     adminID       int64
 }
 
@@ -49,6 +50,7 @@ func NewTelegramBot() *TelegramBot {
         balances:   make(map[int64]int),
         users:      make(map[int64]string),
         userStates: make(map[int64]*UserState),
+        processedReceipts: make(map[string]bool),
         adminID:    adminID,
     }
 }
@@ -222,7 +224,7 @@ func (t *TelegramBot) sendReceiptToAdmin(message *tgbotapi.Message, userID int64
     photos := *message.Photo
     lastPhoto := photos[len(photos)-1]
 
-    caption := fmt.Sprintf("🧾 فیش جدید:\n👤 %s (%d)\n💰 مبلغ: %d تومان", 
+    caption := fmt.Sprintf("🧾 فیش جدید:\n👤 %s\n🆔 آیدی تلگرام: %d\n💰 مبلغ: %d تومان", 
         t.users[userID], userID, amount)
 
     adminMsg := tgbotapi.NewPhotoShare(t.adminID, lastPhoto.FileID)
@@ -270,9 +272,15 @@ func (t *TelegramBot) handleCallbackQuery(callback *tgbotapi.CallbackQuery) {
     default:
         // بررسی تایید یا رد فیش
         if strings.HasPrefix(data, "approve_") {
-            t.approveReceipt(data, callback)
+            // بررسی اینکه آیا این فیش قبلاً پردازش شده یا نه
+            if !t.processedReceipts[data] {
+                t.approveReceipt(data, callback)
+            }
         } else if strings.HasPrefix(data, "reject_") {
-            t.rejectReceipt(data, callback)
+            // بررسی اینکه آیا این فیش قبلاً پردازش شده یا نه
+            if !t.processedReceipts[data] {
+                t.rejectReceipt(data, callback)
+            }
         }
     }
 }
@@ -374,6 +382,10 @@ func (t *TelegramBot) approveReceipt(data string, callback *tgbotapi.CallbackQue
     if amount > 0 {
         t.balances[uid] += amount
         state.PendingAmount = 0
+        
+        // علامت‌گذاری فیش به عنوان پردازش شده
+        t.processedReceipts[data] = true
+        t.processedReceipts["reject_" + uidStr] = true // فیش رد مربوطه هم پردازش شده
 
         // اطلاع‌رسانی به کاربر با دکمه بازگشت به منو
         msg := tgbotapi.NewMessage(uid, 
@@ -385,9 +397,9 @@ func (t *TelegramBot) approveReceipt(data string, callback *tgbotapi.CallbackQue
         )
         t.bot.Send(msg)
         
-        // ویرایش پیام ادمین و حذف دکمه‌ها
+        // حذف کامل دکمه‌های تایید و رد از پیام ادمین
         editMsg := tgbotapi.NewEditMessageReplyMarkup(callback.Message.Chat.ID, 
-            int(callback.Message.MessageID), 
+            callback.Message.MessageID, 
             tgbotapi.NewInlineKeyboardMarkup())
         t.bot.Send(editMsg)
         
@@ -404,6 +416,10 @@ func (t *TelegramBot) rejectReceipt(data string, callback *tgbotapi.CallbackQuer
     
     state := t.userStates[uid]
     state.PendingAmount = 0
+    
+    // علامت‌گذاری فیش به عنوان پردازش شده
+    t.processedReceipts[data] = true
+    t.processedReceipts["approve_" + uidStr] = true // فیش تایید مربوطه هم پردازش شده
 
     // اطلاع‌رسانی به کاربر با دکمه بازگشت به منو
     msg := tgbotapi.NewMessage(uid, 
@@ -415,9 +431,9 @@ func (t *TelegramBot) rejectReceipt(data string, callback *tgbotapi.CallbackQuer
     )
     t.bot.Send(msg)
     
-    // ویرایش پیام ادمین و حذف دکمه‌ها
+    // حذف کامل دکمه‌های تایید و رد از پیام ادمین
     editMsg := tgbotapi.NewEditMessageReplyMarkup(callback.Message.Chat.ID, 
-        int(callback.Message.MessageID), 
+        callback.Message.MessageID, 
         tgbotapi.NewInlineKeyboardMarkup())
     t.bot.Send(editMsg)
     
