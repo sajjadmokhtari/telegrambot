@@ -1,13 +1,19 @@
 package main
 
 import (
+    "database/sql"
+    _ "github.com/mattn/go-sqlite3"
     "fmt"
     "log"
     "strconv"
     "strings"
+    "time"
+    "math/rand"
 
     tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 )
+
+var db *sql.DB
 
 // ساختارهای داده برای مدیریت وضعیت کاربران
 type UserState struct {
@@ -32,9 +38,69 @@ const (
     cardHolder    = "علی اسماعیلی"
 )
 
+// ساختار فیش در انتظار بررسی
+type PendingReceipt struct {
+    ID      string
+    UserID  int64
+    Amount  int
+    PhotoID string
+}
+
+// نگهداری فیش‌های در انتظار بررسی
+var pendingReceipts = make(map[string]PendingReceipt)
+
+// راه‌اندازی دیتابیس و ساخت جدول شارژها و سرویس‌ها
+func initDB() {
+    var err error
+    db, err = sql.Open("sqlite3", "botdata.db")
+    if err != nil {
+        log.Fatalf("خطا در باز کردن دیتابیس: %v", err)
+    }
+    createCharges := `CREATE TABLE IF NOT EXISTS charges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`
+    _, err = db.Exec(createCharges)
+    if err != nil {
+        log.Fatalf("خطا در ساخت جدول شارژها: %v", err)
+    }
+    createServices := `CREATE TABLE IF NOT EXISTS services (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        price INTEGER
+    );`
+    _, err = db.Exec(createServices)
+    if err != nil {
+        log.Fatalf("خطا در ساخت جدول سرویس‌ها: %v", err)
+    }
+    // مهاجرت: افزودن ستون‌های جدید اگر وجود ندارند
+    db.Exec("ALTER TABLE services ADD COLUMN description TEXT;")
+    db.Exec("ALTER TABLE services ADD COLUMN price INTEGER;")
+}
+
+// ارسال فایل دیتابیس به ادمین
+func sendDBBackupToAdmin(bot *tgbotapi.BotAPI, adminID int64) {
+    doc := tgbotapi.NewDocumentUpload(adminID, "botdata.db")
+    doc.Caption = "📦 بکاپ هفتگی دیتابیس ربات"
+    bot.Send(doc)
+}
+
 // تابع اصلی
 func main() {
+    initDB()
     bot := NewTelegramBot()
+
+    // بکاپ هفتگی دیتابیس
+    go func() {
+        for {
+            sendDBBackupToAdmin(bot.bot, bot.adminID)
+            time.Sleep(7 * 24 * time.Hour) // هر هفته یکبار
+        }
+    }()
+
     bot.Start()
 }
 
@@ -80,13 +146,74 @@ func (t *TelegramBot) handleUpdate(update tgbotapi.Update) {
     }
 }
 
+// state افزودن سرویس توسط ادمین
+var adminAddServiceState = struct {
+    Step   int
+    Data   map[string]string
+}{Step: 0, Data: make(map[string]string)}
+
 // مدیریت پیام‌های متنی
 func (t *TelegramBot) handleMessage(message *tgbotapi.Message) {
-    // chatID := message.Chat.ID
+    chatID := message.Chat.ID
     userID := int64(message.From.ID)
     
     // ثبت اطلاعات کاربر
     t.registerUser(userID, message.From.FirstName+" "+message.From.LastName)
+
+    // فرآیند مرحله‌ای افزودن سرویس توسط ادمین (توضیحات و قیمت)
+    if userID == t.adminID && adminAddServiceState.Step > 0 {
+        switch adminAddServiceState.Step {
+        case 1:
+            adminAddServiceState.Data["desc"] = message.Text
+            t.bot.Send(tgbotapi.NewMessage(chatID, "💰 قیمت (تومان)؟"))
+            adminAddServiceState.Step = 2
+            return
+        case 2:
+            adminAddServiceState.Data["price"] = message.Text
+            // ذخیره در دیتابیس
+            desc := adminAddServiceState.Data["desc"]
+            priceStr := adminAddServiceState.Data["price"]
+            price, err := strconv.Atoi(priceStr)
+            if err != nil || price <= 0 {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ قیمت باید عدد مثبت باشد. فرآیند لغو شد."))
+                adminAddServiceState.Step = 0
+                adminAddServiceState.Data = make(map[string]string)
+                return
+            }
+            _, err = db.Exec("INSERT INTO services (name, description, price) VALUES (?, ?, ?)", desc, desc, price)
+            if err != nil {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در افزودن سرویس یا این سرویس قبلاً وجود دارد."))
+            } else {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "✅ سرویس با موفقیت افزوده شد."))
+            }
+            adminAddServiceState.Step = 0
+            adminAddServiceState.Data = make(map[string]string)
+            return
+        }
+    }
+
+    // منطق شروع فرآیند افزودن سرویس توسط ادمین
+    if userID == t.adminID && message.Text == "شروع افزودن سرویس" {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "📝 توضیحات سرویس را وارد کنید (مثال: اینترنت ۲ کاربره، ۵۰ گیگ، ۳ ماهه):"))
+        adminAddServiceState.Step = 1
+        adminAddServiceState.Data = make(map[string]string)
+        return
+    }
+
+    // منطق حذف سرویس توسط ادمین
+    if userID == t.adminID && strings.HasPrefix(message.Text, "حذف سرویس ") {
+        name := strings.TrimSpace(strings.TrimPrefix(message.Text, "حذف سرویس "))
+        if name != "" {
+            res, err := db.Exec("DELETE FROM services WHERE name = ?", name)
+            count, _ := res.RowsAffected()
+            if err != nil || count == 0 {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در حذف سرویس یا چنین سرویسی وجود ندارد."))
+            } else {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "✅ سرویس با موفقیت حذف شد."))
+            }
+        }
+        return
+    }
 
     // مدیریت دستورات
     if message.IsCommand() {
@@ -130,6 +257,10 @@ func (t *TelegramBot) showAdminMenu(chatID int64) {
         tgbotapi.NewInlineKeyboardRow(
             tgbotapi.NewInlineKeyboardButtonData("➕ شارژ دستی کاربر", "manual_charge"),
             tgbotapi.NewInlineKeyboardButtonData("📄 اطلاعات کاربران", "user_info"),
+        ),
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("➕ افزودن سرویس", "start_add_service"),
+            tgbotapi.NewInlineKeyboardButtonData("🗑 حذف سرویس", "delete_service"),
         ),
     )
     msg := tgbotapi.NewMessage(chatID, "👑 به پنل ادمین خوش اومدی")
@@ -215,24 +346,31 @@ func (t *TelegramBot) handleReceiptPhoto(message *tgbotapi.Message) {
 
     t.bot.Send(tgbotapi.NewMessage(chatID, "✅ فیش دریافت شد. در حال بررسی توسط ادمین..."))
 
-    // ارسال فیش برای بررسی ادمین
-    t.sendReceiptToAdmin(message, userID, amount)
-}
-
-// ارسال فیش برای بررسی ادمین
-func (t *TelegramBot) sendReceiptToAdmin(message *tgbotapi.Message, userID int64, amount int) {
+    // تولید شناسه یکتا برای فیش
+    receiptID := fmt.Sprintf("%d_%d_%d", userID, time.Now().UnixNano(), rand.Intn(10000))
     photos := *message.Photo
     lastPhoto := photos[len(photos)-1]
+    pendingReceipts[receiptID] = PendingReceipt{
+        ID:      receiptID,
+        UserID:  userID,
+        Amount:  amount,
+        PhotoID: lastPhoto.FileID,
+    }
 
+    // ارسال فیش برای بررسی ادمین
+    t.sendReceiptToAdminWithID(userID, amount, lastPhoto.FileID, receiptID)
+}
+
+// ارسال فیش برای بررسی ادمین با شناسه یکتا
+func (t *TelegramBot) sendReceiptToAdminWithID(userID int64, amount int, fileID, receiptID string) {
     caption := fmt.Sprintf("🧾 فیش جدید:\n👤 %s\n🆔 آیدی تلگرام: %d\n💰 مبلغ: %d تومان", 
         t.users[userID], userID, amount)
-
-    adminMsg := tgbotapi.NewPhotoShare(t.adminID, lastPhoto.FileID)
+    adminMsg := tgbotapi.NewPhotoShare(t.adminID, fileID)
     adminMsg.Caption = caption
     adminMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
         tgbotapi.NewInlineKeyboardRow(
-            tgbotapi.NewInlineKeyboardButtonData("✅ تایید", fmt.Sprintf("approve_%d", userID)),
-            tgbotapi.NewInlineKeyboardButtonData("❌ رد", fmt.Sprintf("reject_%d", userID)),
+            tgbotapi.NewInlineKeyboardButtonData("✅ تایید", "approve_"+receiptID),
+            tgbotapi.NewInlineKeyboardButtonData("❌ رد", "reject_"+receiptID),
         ),
     )
     t.bot.Send(adminMsg)
@@ -258,7 +396,7 @@ func (t *TelegramBot) handleCallbackQuery(callback *tgbotapi.CallbackQuery) {
     case "user_account":
         t.showUserAccount(chatID, userID)
     case "buy_subscription":
-        t.showSubscriptionInfo(chatID)
+        t.showServicesForUser(chatID, userID)
     case "my_subscriptions":
         t.showMySubscriptions(chatID)
     case "tutorials":
@@ -269,18 +407,23 @@ func (t *TelegramBot) handleCallbackQuery(callback *tgbotapi.CallbackQuery) {
         t.showAllUsersInfo(chatID)
     case "back_to_menu":
         t.showUserMenu(chatID)
+    case "start_add_service":
+        t.bot.Send(tgbotapi.NewMessage(chatID, "لطفاً پیام 'شروع افزودن سرویس' را ارسال کنید."))
+    case "delete_service":
+        t.showServicesForAdminDelete(chatID)
     default:
-        // بررسی تایید یا رد فیش
-        if strings.HasPrefix(data, "approve_") {
-            // بررسی اینکه آیا این فیش قبلاً پردازش شده یا نه
-            if !t.processedReceipts[data] {
-                t.approveReceipt(data, callback)
-            }
+        if strings.HasPrefix(data, "delete_service_") {
+            serviceID := strings.TrimPrefix(data, "delete_service_")
+            t.handleAdminDeleteService(chatID, serviceID)
+        } else if strings.HasPrefix(data, "service_") {
+            serviceID := strings.TrimPrefix(data, "service_")
+            t.handleUserServiceSelect(chatID, userID, serviceID)
+        } else if strings.HasPrefix(data, "approve_") {
+            receiptID := strings.TrimPrefix(data, "approve_")
+            t.approveReceiptByID(receiptID, callback)
         } else if strings.HasPrefix(data, "reject_") {
-            // بررسی اینکه آیا این فیش قبلاً پردازش شده یا نه
-            if !t.processedReceipts[data] {
-                t.rejectReceipt(data, callback)
-            }
+            receiptID := strings.TrimPrefix(data, "reject_")
+            t.rejectReceiptByID(receiptID, callback)
         }
     }
 }
@@ -298,6 +441,9 @@ func (t *TelegramBot) showTopUpMethods(chatID int64) {
 
 // درخواست مبلغ از کاربر
 func (t *TelegramBot) askForAmount(chatID int64, userID int64) {
+    if t.userStates[userID] == nil {
+        t.userStates[userID] = &UserState{}
+    }
     t.userStates[userID].WaitingForAmount = true
     t.bot.Send(tgbotapi.NewMessage(chatID, "💰 لطفاً مبلغ مورد نظر را وارد کن (فقط عدد):"))
 }
@@ -371,58 +517,109 @@ func (t *TelegramBot) showAllUsersInfo(chatID int64) {
     t.bot.Send(tgbotapi.NewMessage(chatID, info))
 }
 
-// تایید فیش توسط ادمین
-func (t *TelegramBot) approveReceipt(data string, callback *tgbotapi.CallbackQuery) {
-    uidStr := strings.TrimPrefix(data, "approve_")
-    uid, _ := strconv.ParseInt(uidStr, 10, 64)
-    
-    state := t.userStates[uid]
-    amount := state.PendingAmount
-    
-    if amount > 0 {
-        t.balances[uid] += amount
-        state.PendingAmount = 0
-        
-        // علامت‌گذاری فیش به عنوان پردازش شده
-        t.processedReceipts[data] = true
-        t.processedReceipts["reject_" + uidStr] = true // فیش رد مربوطه هم پردازش شده
+// نمایش سرویس‌ها به کاربر
+func (t *TelegramBot) showServicesForUser(chatID int64, userID int64) {
+    rows, err := db.Query("SELECT id, description, price FROM services")
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دریافت سرویس‌ها."))
+        return
+    }
+    defer rows.Close()
+    type Service struct {
+        ID    int
+        Desc  string
+        Price int
+    }
+    var services []Service
+    for rows.Next() {
+        var s Service
+        rows.Scan(&s.ID, &s.Desc, &s.Price)
+        services = append(services, s)
+    }
+    if len(services) == 0 {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "🛒 فعلاً پلنی برای خرید فعال نیست!"))
+        return
+    }
+    // ساخت دکمه‌ها
+    var btns [][]tgbotapi.InlineKeyboardButton
+    for _, s := range services {
+        text := s.Desc + " | " + fmt.Sprintf("%d تومان", s.Price)
+        btns = append(btns, tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData(text, fmt.Sprintf("service_%d", s.ID)),
+        ))
+    }
+    msg := tgbotapi.NewMessage(chatID, "لطفاً یکی از سرویس‌های زیر را انتخاب کن:")
+    msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(btns...)
+    t.bot.Send(msg)
+}
 
-        // اطلاع‌رسانی به کاربر با دکمه بازگشت به منو
-        msg := tgbotapi.NewMessage(uid, 
-            fmt.Sprintf("✅ فیش شما تأیید شد و %d تومان به حساب‌تان افزوده شد.", amount))
+// بررسی موجودی کاربر هنگام انتخاب سرویس
+func (t *TelegramBot) handleUserServiceSelect(chatID, userID int64, serviceData string) {
+    // واکشی id عددی سرویس
+    serviceID, err := strconv.Atoi(serviceData)
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ سرویس انتخابی نامعتبر است."))
+        return
+    }
+    var price int
+    err = db.QueryRow("SELECT price FROM services WHERE id = ?", serviceID).Scan(&price)
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دریافت اطلاعات سرویس یا سرویس حذف شده است."))
+        return
+    }
+    balance := t.balances[userID]
+    if balance < price {
+        msg := tgbotapi.NewMessage(chatID, "❌ موجودی کافی نیست. لطفاً حساب خود را شارژ کنید.")
         msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
             tgbotapi.NewInlineKeyboardRow(
-                tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به منو", "back_to_menu"),
+                tgbotapi.NewInlineKeyboardButtonData("⚡ افزایش موجودی", "top_up"),
             ),
         )
         t.bot.Send(msg)
-        
-        // حذف کامل دکمه‌های تایید و رد از پیام ادمین
-        editMsg := tgbotapi.NewEditMessageReplyMarkup(callback.Message.Chat.ID, 
-            callback.Message.MessageID, 
-            tgbotapi.NewInlineKeyboardMarkup())
-        t.bot.Send(editMsg)
-        
-        // اطلاع‌رسانی به ادمین
-        t.bot.Send(tgbotapi.NewMessage(t.adminID, 
-            fmt.Sprintf("🟢 فیش کاربر %d تأیید شد و %d تومان شارژ شد.", uid, amount)))
+        return
     }
+    // اگر موجودی کافی بود، فعلاً فقط پیام موفقیت (در آینده منطق خرید اضافه می‌شود)
+    t.bot.Send(tgbotapi.NewMessage(chatID, "✅ درخواست خرید سرویس ثبت شد. (در حال بررسی...)"))
 }
 
-// رد فیش توسط ادمین
-func (t *TelegramBot) rejectReceipt(data string, callback *tgbotapi.CallbackQuery) {
-    uidStr := strings.TrimPrefix(data, "reject_")
-    uid, _ := strconv.ParseInt(uidStr, 10, 64)
-    
-    state := t.userStates[uid]
-    state.PendingAmount = 0
-    
-    // علامت‌گذاری فیش به عنوان پردازش شده
-    t.processedReceipts[data] = true
-    t.processedReceipts["approve_" + uidStr] = true // فیش تایید مربوطه هم پردازش شده
+// تایید فیش توسط ادمین با receiptID
+func (t *TelegramBot) approveReceiptByID(receiptID string, callback *tgbotapi.CallbackQuery) {
+    receipt, ok := pendingReceipts[receiptID]
+    if !ok {
+        t.bot.Send(tgbotapi.NewMessage(t.adminID, "❌ این فیش قبلاً بررسی شده یا وجود ندارد."))
+        return
+    }
+    t.balances[receipt.UserID] += receipt.Amount
+    // اطلاع‌رسانی به کاربر
+    msg := tgbotapi.NewMessage(receipt.UserID, 
+        fmt.Sprintf("✅ فیش شما تأیید شد و %d تومان به حساب‌تان افزوده شد.", receipt.Amount))
+    msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به منو", "back_to_menu"),
+        ),
+    )
+    t.bot.Send(msg)
+    // حذف دکمه‌ها از پیام ادمین
+    editMsg := tgbotapi.NewEditMessageReplyMarkup(callback.Message.Chat.ID, 
+        callback.Message.MessageID, 
+        tgbotapi.NewInlineKeyboardMarkup())
+    t.bot.Send(editMsg)
+    // اطلاع‌رسانی به ادمین
+    t.bot.Send(tgbotapi.NewMessage(t.adminID, 
+        fmt.Sprintf("🟢 فیش کاربر %d تأیید شد و %d تومان شارژ شد.", receipt.UserID, receipt.Amount)))
+    // حذف فیش از map
+    delete(pendingReceipts, receiptID)
+}
 
-    // اطلاع‌رسانی به کاربر با دکمه بازگشت به منو
-    msg := tgbotapi.NewMessage(uid, 
+// رد فیش توسط ادمین با receiptID
+func (t *TelegramBot) rejectReceiptByID(receiptID string, callback *tgbotapi.CallbackQuery) {
+    receipt, ok := pendingReceipts[receiptID]
+    if !ok {
+        t.bot.Send(tgbotapi.NewMessage(t.adminID, "❌ این فیش قبلاً بررسی شده یا وجود ندارد."))
+        return
+    }
+    // اطلاع‌رسانی به کاربر
+    msg := tgbotapi.NewMessage(receipt.UserID, 
         "❌ فیش شما رد شد. لطفاً بررسی کرده و مجدداً ارسال نمایید.")
     msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
         tgbotapi.NewInlineKeyboardRow(
@@ -430,16 +627,67 @@ func (t *TelegramBot) rejectReceipt(data string, callback *tgbotapi.CallbackQuer
         ),
     )
     t.bot.Send(msg)
-    
-    // حذف کامل دکمه‌های تایید و رد از پیام ادمین
+    // حذف دکمه‌ها از پیام ادمین
     editMsg := tgbotapi.NewEditMessageReplyMarkup(callback.Message.Chat.ID, 
         callback.Message.MessageID, 
         tgbotapi.NewInlineKeyboardMarkup())
     t.bot.Send(editMsg)
-    
     // اطلاع‌رسانی به ادمین
     t.bot.Send(tgbotapi.NewMessage(t.adminID, 
-        fmt.Sprintf("🔴 فیش کاربر %d رد شد.", uid)))
+        fmt.Sprintf("🔴 فیش کاربر %d رد شد.", receipt.UserID)))
+    // حذف فیش از map
+    delete(pendingReceipts, receiptID)
+}
+
+// نمایش سرویس‌ها به ادمین برای حذف
+func (t *TelegramBot) showServicesForAdminDelete(chatID int64) {
+    rows, err := db.Query("SELECT id, description, price FROM services")
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دریافت سرویس‌ها."))
+        return
+    }
+    defer rows.Close()
+    type Service struct {
+        ID    int
+        Desc  string
+        Price int
+    }
+    var services []Service
+    for rows.Next() {
+        var s Service
+        rows.Scan(&s.ID, &s.Desc, &s.Price)
+        services = append(services, s)
+    }
+    if len(services) == 0 {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "هیچ سرویسی برای حذف وجود ندارد."))
+        return
+    }
+    var btns [][]tgbotapi.InlineKeyboardButton
+    for _, s := range services {
+        text := s.Desc + " | " + fmt.Sprintf("%d تومان", s.Price)
+        btns = append(btns, tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData(text, fmt.Sprintf("delete_service_%d", s.ID)),
+        ))
+    }
+    msg := tgbotapi.NewMessage(chatID, "برای حذف، روی سرویس مورد نظر کلیک کنید:")
+    msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(btns...)
+    t.bot.Send(msg)
+}
+
+// حذف سرویس با id
+func (t *TelegramBot) handleAdminDeleteService(chatID int64, serviceID string) {
+    id, err := strconv.Atoi(serviceID)
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ سرویس انتخابی نامعتبر است."))
+        return
+    }
+    res, err := db.Exec("DELETE FROM services WHERE id = ?", id)
+    count, _ := res.RowsAffected()
+    if err != nil || count == 0 {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در حذف سرویس یا چنین سرویسی وجود ندارد."))
+    } else {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "✅ سرویس با موفقیت حذف شد."))
+    }
 }
 
 
