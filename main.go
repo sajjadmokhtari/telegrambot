@@ -3,13 +3,18 @@ package main
 import (
     "database/sql"
     _ "github.com/mattn/go-sqlite3"
+    "encoding/json"
     "fmt"
+    "io"
     "log"
+    "net/http"
+    "net/url"
     "strconv"
     "strings"
     "time"
     "math/rand"
 
+    "github.com/google/uuid"
     tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 )
 
@@ -60,6 +65,14 @@ var adminBroadcastState = struct {
     Waiting bool
 }{Waiting: false}
 
+// وضعیت افزودن پنل
+var adminPanelState = struct {
+    Step int
+    Cookie string
+    Link   string
+    ID     string
+}{Step: 0, Cookie: "", Link: "", ID: ""}
+
 // راه‌اندازی دیتابیس و ساخت جدول شارژها و سرویس‌ها
 func initDB() {
     var err error
@@ -86,6 +99,31 @@ func initDB() {
     _, err = db.Exec(createServices)
     if err != nil {
         log.Fatalf("خطا در ساخت جدول سرویس‌ها: %v", err)
+    }
+    // جدول اشتراک‌های خریداری‌شده
+    createSubscriptions := `CREATE TABLE IF NOT EXISTS subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        service_id INTEGER,
+        description TEXT,
+        price INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`
+    _, err = db.Exec(createSubscriptions)
+    if err != nil {
+        log.Fatalf("خطا در ساخت جدول اشتراک‌ها: %v", err)
+    }
+    // جدول تنظیمات پنل
+    createPanelSettings := `CREATE TABLE IF NOT EXISTS panel_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cookie TEXT NOT NULL,
+        link TEXT NOT NULL,
+        panel_id TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`
+    _, err = db.Exec(createPanelSettings)
+    if err != nil {
+        log.Fatalf("خطا در ساخت جدول تنظیمات پنل: %v", err)
     }
     // مهاجرت: افزودن ستون‌های جدید اگر وجود ندارند
     db.Exec("ALTER TABLE services ADD COLUMN description TEXT;")
@@ -276,6 +314,50 @@ func (t *TelegramBot) handleMessage(message *tgbotapi.Message) {
         return
     }
 
+    // فرآیند مرحله‌ای افزودن پنل توسط ادمین
+    if userID == t.adminID && adminPanelState.Step > 0 {
+        switch adminPanelState.Step {
+        case 1:
+            // دریافت کوکی
+            adminPanelState.Cookie = message.Text
+            t.bot.Send(tgbotapi.NewMessage(chatID, "🔗 لطفاً لینک پنل را وارد کنید:"))
+            adminPanelState.Step = 2
+            return
+        case 2:
+            // دریافت لینک
+            adminPanelState.Link = message.Text
+            t.bot.Send(tgbotapi.NewMessage(chatID, "🆔 لطفاً آیدی پنل را وارد کنید:"))
+            adminPanelState.Step = 3
+            return
+        case 3:
+            // دریافت آیدی و ذخیره در دیتابیس
+            adminPanelState.ID = message.Text
+            
+            // حذف تنظیمات قبلی (فقط یک پنل فعال)
+            db.Exec("DELETE FROM panel_settings")
+            
+            // ذخیره تنظیمات جدید
+            _, err := db.Exec("INSERT INTO panel_settings (cookie, link, panel_id) VALUES (?, ?, ?)", 
+                adminPanelState.Cookie, adminPanelState.Link, adminPanelState.ID)
+            if err != nil {
+                t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در ذخیره تنظیمات پنل: "+err.Error()))
+            } else {
+                msg := tgbotapi.NewMessage(chatID, "✅ تنظیمات پنل با موفقیت ذخیره شد!")
+                msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+                    tgbotapi.NewInlineKeyboardRow(
+                        tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به پنل ادمین", "back_to_admin_panel"),
+                    ),
+                )
+                t.bot.Send(msg)
+            }
+            adminPanelState.Step = 0
+            adminPanelState.Cookie = ""
+            adminPanelState.Link = ""
+            adminPanelState.ID = ""
+            return
+        }
+    }
+
     // مدیریت دستورات
     if message.IsCommand() {
         t.handleCommand(message)
@@ -324,6 +406,7 @@ func (t *TelegramBot) showAdminMenu(chatID int64) {
             tgbotapi.NewInlineKeyboardButtonData("🗑 حذف سرویس", "delete_service"),
         ),
         tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("⚙️ افزودن پنل", "add_panel"),
             tgbotapi.NewInlineKeyboardButtonData("📢 اطلاع رسانی همگانی", "broadcast"),
         ),
     )
@@ -477,6 +560,12 @@ func (t *TelegramBot) handleCallbackQuery(callback *tgbotapi.CallbackQuery) {
         t.bot.Send(tgbotapi.NewMessage(chatID, "لطفاً پیام 'شروع افزودن سرویس' را ارسال کنید."))
     case "delete_service":
         t.showServicesForAdminDelete(chatID)
+    case "add_panel":
+        adminPanelState.Step = 1
+        adminPanelState.Cookie = ""
+        adminPanelState.Link = ""
+        adminPanelState.ID = ""
+        t.bot.Send(tgbotapi.NewMessage(chatID, "🍪 لطفاً کوکی پنل را وارد کنید:"))
     case "broadcast":
         adminBroadcastState.Waiting = true
         t.bot.Send(tgbotapi.NewMessage(chatID, "✏️ لطفاً پیام مورد نظر برای ارسال به همه کاربران را وارد کنید:"))
@@ -545,7 +634,26 @@ func (t *TelegramBot) showSubscriptionInfo(chatID int64) {
 
 // نمایش اشتراک‌های کاربر
 func (t *TelegramBot) showMySubscriptions(chatID int64) {
-    msg := tgbotapi.NewMessage(chatID, "📦 شما در حال حاضر اشتراک فعالی ندارید.")
+    rows, err := db.Query("SELECT description, price, created_at FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC", chatID)
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دریافت اشتراک‌ها."))
+        return
+    }
+    defer rows.Close()
+    var result string
+    var count int
+    for rows.Next() {
+        var desc string
+        var price int
+        var created string
+        rows.Scan(&desc, &price, &created)
+        count++
+        result += fmt.Sprintf("%d. %s\n💰 قیمت: %d تومان\n📅 خرید: %s\n\n", count, desc, price, created)
+    }
+    if count == 0 {
+        result = "📦 شما هیچ اشتراک فعالی ندارید."
+    }
+    msg := tgbotapi.NewMessage(chatID, result)
     msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
         tgbotapi.NewInlineKeyboardRow(
             tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به منو", "back_to_menu"),
@@ -621,11 +729,21 @@ func (t *TelegramBot) handleUserServiceSelect(chatID, userID int64, serviceData 
         return
     }
     var price int
-    err = db.QueryRow("SELECT price FROM services WHERE id = ?", serviceID).Scan(&price)
+    var desc string
+    err = db.QueryRow("SELECT price, description FROM services WHERE id = ?", serviceID).Scan(&price, &desc)
     if err != nil {
         t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دریافت اطلاعات سرویس یا سرویس حذف شده است."))
         return
     }
+    
+    // بررسی وجود تنظیمات پنل
+    var panelExists bool
+    err = db.QueryRow("SELECT COUNT(*) FROM panel_settings").Scan(&panelExists)
+    if err != nil || !panelExists {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ تنظیمات پنل یافت نشد. لطفاً با ادمین تماس بگیرید."))
+        return
+    }
+    
     balance := t.balances[userID]
     if balance < price {
         msg := tgbotapi.NewMessage(chatID, "❌ موجودی کافی نیست. لطفاً حساب خود را شارژ کنید.")
@@ -637,8 +755,154 @@ func (t *TelegramBot) handleUserServiceSelect(chatID, userID int64, serviceData 
         t.bot.Send(msg)
         return
     }
-    // اگر موجودی کافی بود، فعلاً فقط پیام موفقیت (در آینده منطق خرید اضافه می‌شود)
-    t.bot.Send(tgbotapi.NewMessage(chatID, "✅ درخواست خرید سرویس ثبت شد. (در حال بررسی...)"))
+    // کم کردن مبلغ سرویس از موجودی کاربر
+    t.balances[userID] -= price
+    // ثبت تراکنش منفی در دیتابیس
+    db.Exec("INSERT INTO charges (user_id, amount) VALUES (?, ?)", userID, -price)
+    // ثبت اشتراک جدید برای کاربر
+    db.Exec("INSERT INTO subscriptions (user_id, service_id, description, price) VALUES (?, ?, ?, ?)", userID, serviceID, desc, price)
+    // استخراج تعداد ماه و گیگ از description (مثلاً "3 ماهه 100 گیگ")
+    months, gb := extractMonthAndGB(desc)
+    // فراخوانی تابع addClient برای تولید لینک
+    link, err := addClient(gb, months)
+    if err != nil {
+        t.bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در تولید لینک: "+err.Error()))
+        return
+    }
+    // ارسال لینک به کاربر
+    msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ سرویس با موفقیت فعال شد!\n\n🔗 لینک کانفیگ شما:\n`%s`", link))
+    msg.ParseMode = "Markdown"
+    msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("🏠 بازگشت به منو", "back_to_menu"),
+        ),
+    )
+    t.bot.Send(msg)
+}
+
+// تابع تولید لینک از پنل
+func addClient(gb int, days int) (string, error) {
+    // دریافت تنظیمات پنل از دیتابیس
+    var cookie, link, panelID string
+    err := db.QueryRow("SELECT cookie, link, panel_id FROM panel_settings ORDER BY id DESC LIMIT 1").Scan(&cookie, &link, &panelID)
+    if err != nil {
+        return "", fmt.Errorf("تنظیمات پنل یافت نشد. لطفاً ابتدا پنل را تنظیم کنید")
+    }
+    
+    clientID := uuid.New().String()
+    email := randomEmail(8)
+    subID := randomEmail(16)
+    expiryTime := -1 * days * 24 * 60 * 60 * 1000 // milliseconds
+
+    clients := map[string]interface{}{
+        "clients": []map[string]interface{}{
+            {
+                "id":         clientID,
+                "flow":       "",
+                "email":      email,
+                "limitIp":    0,
+                "totalGB":    gb * 1073741824, // convert GB to bytes
+                "expiryTime": expiryTime,
+                "enable":     true,
+                "tgId":       "",
+                "subId":      subID,
+                "reset":      0,
+            },
+        },
+    }
+
+    settingsJson, _ := json.Marshal(clients)
+
+    data := url.Values{}
+    data.Set("id", panelID)
+    data.Set("settings", string(settingsJson))
+
+    req, err := http.NewRequest("POST", link+"/panel/inbound/addClient", strings.NewReader(data.Encode()))
+    if err != nil {
+        return "", err
+    }
+
+    req.Header.Set("Accept", "application/json, text/plain, */*")
+    req.Header.Set("Accept-Language", "en-US,en;q=0.9,fa-IR;q=0.8,fa;q=0.7")
+    req.Header.Set("Connection", "keep-alive")
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.Header.Set("Cookie", cookie)
+    req.Header.Set("Origin", link)
+    req.Header.Set("Referer", link+"/panel/inbounds")
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+    req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    if resp.StatusCode != 200 {
+        return "", fmt.Errorf("Non-200 response: %s", string(body))
+    }
+
+    if strings.Contains(string(body), `"success":true`) {
+        // generate config link - extract domain from panel link
+        domain := extractDomainFromLink(link)
+        config := fmt.Sprintf("vless://%s@%s:8080?type=ws&path=%%2F&host=&security=none#%%40aliping_shop%%20%%7C-%s", clientID, domain, email)
+        return config, nil
+    }
+
+    return "", fmt.Errorf("Request failed: %s", string(body))
+}
+
+// تابع استخراج دامنه از لینک پنل
+func extractDomainFromLink(link string) string {
+    // حذف پروتکل
+    if strings.HasPrefix(link, "http://") {
+        link = strings.TrimPrefix(link, "http://")
+    } else if strings.HasPrefix(link, "https://") {
+        link = strings.TrimPrefix(link, "https://")
+    }
+    
+    // حذف مسیر اضافی
+    if strings.Contains(link, "/") {
+        link = strings.Split(link, "/")[0]
+    }
+    
+    return link
+}
+
+// تابع تولید ایمیل تصادفی
+func randomEmail(length int) string {
+    const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+    rand.Seed(time.Now().UnixNano())
+
+    result := make([]byte, length)
+    for i := range result {
+        result[i] = charset[rand.Intn(len(charset))]
+    }
+    return string(result)
+}
+
+// تابع استخراج تعداد ماه و گیگ از description
+func extractMonthAndGB(desc string) (int, int) {
+    // مثال ورودی: "3 ماهه 100 گیگ"
+    var months, gb int
+    // جستجو برای عدد ماه
+    for _, word := range strings.Fields(desc) {
+        if strings.Contains(word, "ماه") {
+            fmt.Sscanf(word, "%d", &months)
+        }
+        if strings.Contains(word, "گیگ") {
+            fmt.Sscanf(word, "%d", &gb)
+        }
+    }
+    if months == 0 {
+        months = 1 // پیش‌فرض یک ماه
+    }
+    if gb == 0 {
+        gb = 10 // پیش‌فرض 10 گیگ
+    }
+    return months, gb
 }
 
 // تایید فیش توسط ادمین با receiptID
